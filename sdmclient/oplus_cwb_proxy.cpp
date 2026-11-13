@@ -14,6 +14,10 @@
 #include <sys/system_properties.h>
 #include <unistd.h>
 
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
+
 #define OPLUS_CWB_LOG_TAG "OplusCwbProxy"
 #define CWB_LOGI(...) \
   __android_log_print(ANDROID_LOG_INFO, OPLUS_CWB_LOG_TAG, __VA_ARGS__)
@@ -31,8 +35,6 @@ constexpr size_t kCwbProxySize = 0x20;
 //   +0x2c9 enable  (CwbService::enable) — libcwb_client never calls enable()
 constexpr size_t kProxyServicePtr = 0x10;
 constexpr size_t kServiceEnableFlag = 0x2c9;
-// Verbose getRGBValue logging inside libcwb_qcom_aidl (+0xd4)
-constexpr size_t kServiceDebugFlag = 0xd4;
 
 constexpr const char kLib[] = "libcwb_qcom_aidl.so";
 constexpr const char kInitSym[] = "_ZN8CwbProxy10initializeEv";
@@ -45,8 +47,10 @@ constexpr const char kNotifyColorSym[] =
 constexpr const char kNotifySym[] =
     "_ZN4aidl6vendor5oplus8hardware3cwb14implementation10CwbService15notifyCwbStatusEv";
 constexpr const char kGateProp[] = "ro.vendor.oplus.display.cwb.display_id";
-// SDMPowerMode::POWER_MODE_ON — CwbService treats 0 as screen off.
+// SDMPowerMode values. CwbService treats 0 as screen off.
+constexpr int32_t kPowerModeOff = 0;
 constexpr int32_t kPowerModeOn = 2;
+constexpr int32_t kPowerModeDozeSuspend = 3;
 
 using InitializeFn = int (*)(void *self);
 using UpdateCwbStatusFn = void (*)(void *self, bool ready);
@@ -67,6 +71,19 @@ NotifyCwbStatusFn gNotify = nullptr;
 bool gStarted = false;
 bool gLoggedEnable = false;
 
+// Power mode of the gated display, from OplusCwbSetPowerMode. PostInit runs
+// with the panel already on.
+std::mutex gPowerMutex;
+std::condition_variable gPowerCv;
+uint64_t gGateDisplay = 0;
+int32_t gPowerMode = kPowerModeOn;
+
+// The composer refuses CWB while the panel is off or in suspended doze, so
+// nothing reads the status then.
+bool PanelLit(int32_t mode) {
+  return mode != kPowerModeOff && mode != kPowerModeDozeSuspend;
+}
+
 void *ServicePtr() {
   return *reinterpret_cast<void **>(gProxy + kProxyServicePtr);
 }
@@ -80,23 +97,29 @@ void EnsureEnabled(bool notify) {
   auto *bytes = reinterpret_cast<uint8_t *>(service);
   const bool was = bytes[kServiceEnableFlag] != 0;
   bytes[kServiceEnableFlag] = 1;
-  bytes[kServiceDebugFlag] = 1;
   if (notify && gNotify != nullptr) {
     gNotify(service);
   }
   if (!gLoggedEnable || !was) {
-    CWB_LOGI("CwbService enabled (+0x2c9=%u debug=%u)", bytes[kServiceEnableFlag],
-             bytes[kServiceDebugFlag]);
+    CWB_LOGI("CwbService enabled (+0x2c9=%u)", bytes[kServiceEnableFlag]);
     gLoggedEnable = true;
   }
 }
 
+// Re-assert the status and the enable bit once a second while the panel is
+// lit, in case something clears them, and right after every power change.
+// Sleep while the panel is dark: this used to wake the composer five times a
+// second for its whole life.
 void *StatusLoop(void *) {
+  std::unique_lock<std::mutex> lock(gPowerMutex);
   while (gUpdate != nullptr) {
+    gPowerCv.wait(lock, [] { return PanelLit(gPowerMode); });
+    const int32_t mode = gPowerMode;
+    lock.unlock();
     gUpdate(gProxy, true);
-    // Re-assert enable/debug bits in case something clears them; no notify spam.
     EnsureEnabled(false);
-    usleep(200 * 1000);
+    lock.lock();
+    gPowerCv.wait_for(lock, std::chrono::seconds(1), [mode] { return gPowerMode != mode; });
   }
   return nullptr;
 }
@@ -161,6 +184,7 @@ void InitOplusCwbProxy() {
   char disp[PROP_VALUE_MAX] = {};
   __system_property_get(kGateProp, disp);
   const uint64_t display_id = static_cast<uint64_t>(strtoull(disp, nullptr, 0));
+  gGateDisplay = display_id;
   if (gSetPower != nullptr) {
     gSetPower(gProxy, display_id, kPowerModeOn);
     CWB_LOGI("CwbProxy::setPowerMode(display=%llu, ON)",
@@ -177,10 +201,20 @@ void InitOplusCwbProxy() {
 }
 
 void OplusCwbSetPowerMode(uint64_t display, int32_t mode) {
-  if (!gStarted || gSetPower == nullptr) {
+  if (!gStarted) {
     return;
   }
-  gSetPower(gProxy, display, mode);
+  if (gSetPower != nullptr) {
+    gSetPower(gProxy, display, mode);
+  }
+  if (display != gGateDisplay) {
+    return;
+  }
+  {
+    std::lock_guard<std::mutex> lock(gPowerMutex);
+    gPowerMode = mode;
+  }
+  gPowerCv.notify_all();
 }
 
 void OplusCwbInvalidCache() {
